@@ -3,6 +3,7 @@ Deployment script, written in python,  for Qt or Non Qt-C/C++ executable program
 
 Command line usage:
 
+python cpldd.py Input_Exe_Path Output_Folder_Path
 cpldd.exe Input_Exe_Path Output_Folder_Path
 
 Optional Arguments:
