@@ -12,6 +12,8 @@
 -f : Force dependencies from "system32" folder to be copied to the deployment folder
 
 ## Sample Output:
-The following two screenshots show console outputs when a very complicated piece of software with tons of dependencies is deployed using cpld. The two screenshots only differ by the compiler tool chain (MSVC vs MSYS2), which can be seen in the following images.
+The following two screenshots show console outputs when a C++ executable which is an oucome of very complicated project with tons of dependencies (Qt//VTK/ITK/OpenBlas/ ...) is deployed using cpld. The two screenshots only differ by the compiler tool chain (MSVC vs MSYS2), which can be seen in the following images.
   ![MSVC output](screenshot_msvc.PNG)
   ![MSYS2 output](screenshot_msys2.PNG)
+
+Despite all the complicated dependencies, CPLDD has been shown to be successful 100%. 
