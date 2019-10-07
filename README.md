@@ -6,6 +6,8 @@ Deployment script, written in python,  for Qt or Non Qt-C/C++ executable program
 python cpldd.py Input_Exe_Path Output_Folder_Path
 cpldd.exe Input_Exe_Path Output_Folder_Path
 
+  ![MSVC output](screenshot_msvc.PNG)
+
 ##Optional Arguments:
 
 -f : Force dependencies from "system32" folder to be copied to the deployment folder
