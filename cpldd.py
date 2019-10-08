@@ -82,7 +82,6 @@ args = parser.parse_args()
 inputexe = args.inputexe
 outputfolder = args.outputfolder
 ignoresystem32 = not args.force
-print (ignoresystem32)
 distutils.dir_util.mkpath(outputfolder)
 copieddlls = 0
 
