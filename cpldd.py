@@ -82,6 +82,7 @@ args = parser.parse_args()
 inputexe = args.inputexe
 outputfolder = args.outputfolder
 ignoresystem32 = not args.force
+print (ignoresystem32)
 distutils.dir_util.mkpath(outputfolder)
 copieddlls = 0
 
@@ -102,7 +103,7 @@ for i in range(n):
     if(res1<0):
         dllfile = GetWindowsPath(Files[i]).rstrip()
         if (ignoresystem32 is True):
-            res2 = Files[i].lower().find("/c/windows/system32/")
+            res2 = Files[i].lower().find("/windows/system32/")
             if (res2>0):
                 print("System DLL Ignored: " +str(i+1) +"[" +str(int(100*(i+1)/n))  + "%]: " + strike(dllfile))
             else:
@@ -113,7 +114,7 @@ for i in range(n):
             copieddlls = copieddlls + 1
         
     else:
-        print("Invalid DLL Ignored..." +str(i+1) +"[" +str(int(100*(i+1)/n))  + "%]: " + " strike(dll not recognized)")
+        print("Invalid DLL Ignored..." +str(i+1) +"[" +str(int(100*(i+1)/n))  + "%]: " + strike(" dll not recognized"))
     
 print("Total "+ str(copieddlls) + " Number of Non-Qt dlls Copied")    
 
