@@ -18,3 +18,8 @@ The following two screenshots show console outputs when a C++ executable, which 
   ![MSYS2 output](screenshot_msys2.PNG)
 
 Despite all the complicated dependencies, CPLDD has been shown to be successful 100%. 
+
+## Download
+
+Download the latest binaries from the release section: <https://github.com/harshn05/cpldd/releases/latest>.
+
