@@ -1,34 +1,101 @@
+
 # -*- mode: python ; coding: utf-8 -*-
+
+# ============================================================
+# CPLDD - PyInstaller Specification
+# Portable Windows DLL Deployment Helper
+#
+# Build:
+#   python -m PyInstaller --clean --noconfirm cpldd.spec
+#
+# Output:
+#   dist/cpldd.exe
+# ============================================================
+
+from pathlib import Path
+
 block_cipher = None
-a = Analysis(['cpldd.py'],
-             pathex=['C:\\Users\\harshn\\Desktop\\cpldd'],
-             #binaries=[('cygpath.exe','.'),('ldd.exe','.'),('msys-2.0.dll','.')],
-			 binaries=[],
-			 #datas=[('cygpath.exe','.'),('ldd.exe','.'),('msys-2.0.dll','.')],
-             datas=[],
-             #hiddenimports=[('cygpath.exe','.'),('ldd.exe','.'),('msys-2.0.dll','.')],
-			 hiddenimports=[],
-             hookspath=[],
-             runtime_hooks=[],
-             excludes=[],
-             win_no_prefer_redirects=False,
-             win_private_assemblies=False,
-             cipher=block_cipher,
-             noarchive=False)
-			 
-pyz = PYZ(a.pure, a.zipped_data,
-             cipher=block_cipher)
-exe = EXE(pyz,
-          a.scripts,
-          a.binaries,
-          a.zipfiles,
-          a.datas,
-          [],
-          name='cpldd',
-          debug=False,
-          bootloader_ignore_signals=False,
-          strip=False,
-          upx=False,
-          upx_exclude=[],
-          runtime_tmpdir=None,
-          console=True )
+
+# ------------------------------------------------------------
+# Project paths
+# ------------------------------------------------------------
+
+PROJECT_DIR = Path(SPECPATH).resolve()
+ENTRY_SCRIPT = PROJECT_DIR / "cpldd.py"
+
+if not ENTRY_SCRIPT.is_file():
+    raise FileNotFoundError(
+        f"CPLDD entry script not found: {ENTRY_SCRIPT}"
+    )
+
+# ------------------------------------------------------------
+# Analysis
+# ------------------------------------------------------------
+
+a = Analysis(
+    [str(ENTRY_SCRIPT)],
+
+    pathex=[
+        str(PROJECT_DIR),
+    ],
+
+    # External tools are discovered from active PATH.
+    binaries=[],
+    datas=[],
+
+    hiddenimports=[],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+
+    noarchive=False,
+)
+
+# ------------------------------------------------------------
+# Python archive
+# ------------------------------------------------------------
+
+pyz = PYZ(
+    a.pure,
+    a.zipped_data,
+    cipher=block_cipher,
+)
+
+# ------------------------------------------------------------
+# Standalone executable
+# ------------------------------------------------------------
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+
+    name="cpldd",
+
+    # Console application
+    console=True,
+
+    # Debugging
+    debug=False,
+    bootloader_ignore_signals=False,
+    disable_windowed_traceback=False,
+
+    # Binary options
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+
+    # Runtime
+    runtime_tmpdir=None,
+
+    # Windows
+    argv_emulation=False,
+    target_arch=None,
+
+    # Code signing (disabled)
+    codesign_identity=None,
+    entitlements_file=None,
+)
