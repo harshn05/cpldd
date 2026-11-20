@@ -5,6 +5,8 @@ on:
     tags:
       - '[0-9]*'
 
+  workflow_dispatch:
+
 permissions:
   contents: write
 
@@ -89,7 +91,16 @@ jobs:
 
           python -c "import zipfile; z=zipfile.ZipFile('cpldd.zip'); expected={'cpldd.exe','cygpath.exe','ldd.exe','msys-2.0.dll'}; actual=set(z.namelist()); assert actual == expected, f'Unexpected ZIP contents: {actual}'; print('ZIP contents verified:', sorted(actual))"
 
+      - name: Upload ZIP as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpldd-bundle-${{ github.run_number }}
+          path: cpldd.zip
+          if-no-files-found: error
+          compression-level: 0
+
       - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
