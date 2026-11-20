@@ -5,13 +5,6 @@ on:
     tags:
       - '[0-9]*'
 
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing tag to build and publish (for example: 4)
-        required: true
-        type: string
-
 permissions:
   contents: write
 
@@ -23,8 +16,6 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -38,13 +29,15 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pyinstaller zstandard
 
-      - name: Build cpldd.exe
+      - name: Build cpldd.exe with PyInstaller
         shell: pwsh
         run: |
           python -m PyInstaller --clean --noconfirm cpldd_.spec
+
           if (-not (Test-Path "dist/cpldd.exe")) {
             throw "PyInstaller did not produce dist/cpldd.exe"
           }
+
           & "dist/cpldd.exe" --help
           if ($LASTEXITCODE -ne 0) {
             throw "cpldd.exe --help smoke test failed"
@@ -54,6 +47,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path package | Out-Null
+
           python scripts/fetch_msys2_runtime.py --output-dir package
           if ($LASTEXITCODE -ne 0) {
             throw "MSYS2 runtime download/extraction failed"
@@ -77,22 +71,29 @@ jobs:
             }
           }
 
-          $actual = @(Get-ChildItem package -File | ForEach-Object Name | Sort-Object)
+          $actual = @(
+            Get-ChildItem package -File |
+              ForEach-Object Name |
+              Sort-Object
+          )
           $expectedSorted = @($expected | Sort-Object)
 
           if (Compare-Object $expectedSorted $actual) {
-            throw "Unexpected files in package directory."
+            throw "Package directory does not contain exactly the four expected binaries."
           }
 
-          Compress-Archive -Path "package/*" -DestinationPath "cpldd.zip" -CompressionLevel Optimal
+          Compress-Archive `
+            -Path "package/*" `
+            -DestinationPath "cpldd.zip" `
+            -CompressionLevel Optimal
 
           python -c "import zipfile; z=zipfile.ZipFile('cpldd.zip'); expected={'cpldd.exe','cygpath.exe','ldd.exe','msys-2.0.dll'}; actual=set(z.namelist()); assert actual == expected, f'Unexpected ZIP contents: {actual}'; print('ZIP contents verified:', sorted(actual))"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          name: CPLDD ${{ github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          name: CPLDD ${{ github.ref_name }}
           generate_release_notes: true
           overwrite_files: true
           fail_on_unmatched_files: true
