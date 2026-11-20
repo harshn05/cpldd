@@ -22,9 +22,10 @@ Typical usage:
 Exit codes:
     0  Success.
     2  Input executable not found.
-    3  ldd failed or produced no output.
+    3  ldd failed or produced no usable output.
     4  One or more dependencies were missing.
     5  A file copy failed.
+    6  Invalid output directory (e.g. resolves to the input directory).
 """
 
 from __future__ import annotations
@@ -162,11 +163,20 @@ def cygpath_to_windows(path: str) -> Path | None:
 _LDD_LINE_RE = re.compile(
     r"^\s*(?P<name>\S+)\s+=>\s+(?P<rest>.+?)\s*$"
 )
+# Lines that carry a base address but no "=>": treat as informational only.
+_LDD_BARE_ADDR_RE = re.compile(r"^\s*\S+\s+\(0x[0-9A-Fa-f]+\)\s*$")
 _LDD_BASE_ADDR_RE = re.compile(r"\s*\([0-9A-Fa-fx]+\)\s*$")
 
 
-def run_ldd(executable: Path) -> str:
-    """Run ldd against an executable and return its stdout/stderr."""
+def run_ldd(executable: Path, *, verbose: bool = False) -> str:
+    """
+    Run ldd against an executable and return its stdout/stderr.
+
+    MSYS2/Cygwin ldd commonly exits non-zero *with valid output* when one
+    dependency is "not found". We treat usable output as success and let
+    the caller decide what to do via the parsed dependency list. Only an
+    empty result is a hard failure.
+    """
     ldd = shutil.which("ldd")
 
     if not ldd:
@@ -200,9 +210,13 @@ def run_ldd(executable: Path) -> str:
         )
 
     if result.returncode != 0:
-        raise RuntimeError(
-            f"ldd exited with code {result.returncode}. Output:\n{output}"
-        )
+        # Non-zero exit with usable output is expected when dependencies
+        # are missing; do not abort the deployment over it.
+        if verbose:
+            warn(
+                f"  [ldd] exited with code {result.returncode}; "
+                f"parsing output anyway."
+            )
 
     return output
 
@@ -232,7 +246,9 @@ def parse_ldd_output(
         foo.dll => /path/foo.dll (0x...)
         foo.dll => /path/foo.dll
 
-    Unparsed lines are reported only when ``verbose`` is True.
+    Only lines containing "=>" yield dependencies. Bare base-address lines
+    (e.g. the main executable's own entry on some ldd variants) are
+    informational and are reported only under ``verbose``.
     """
     dependencies: list[Dependency] = []
     seen: set[tuple[str, str | None]] = set()
@@ -245,10 +261,11 @@ def parse_ldd_output(
         match = _LDD_LINE_RE.match(line)
 
         if not match:
-            if verbose and "=>" in line:
-                warn(f"  [ldd] unparsed: {line}")
-            elif verbose:
-                warn(f"  [ldd] ignored: {line}")
+            if verbose:
+                if _LDD_BARE_ADDR_RE.match(line):
+                    info(f"  [ldd] informational: {line}")
+                else:
+                    warn(f"  [ldd] unparsed: {line}")
             continue
 
         name = match.group("name")
@@ -302,6 +319,41 @@ def _normcase_normpath(path: Path | str) -> str:
     return os.path.normcase(os.path.normpath(str(path)))
 
 
+_SYSTEM_ROOTS_CACHE: list[str] | None = None
+
+
+def _system_roots() -> list[str]:
+    """
+    Return the normalized Windows system directories to skip.
+
+    Computed once and cached, since resolving these per dependency is
+    needlessly expensive for large dependency lists.
+    """
+    global _SYSTEM_ROOTS_CACHE
+    if _SYSTEM_ROOTS_CACHE is not None:
+        return _SYSTEM_ROOTS_CACHE
+
+    windir = os.environ.get("WINDIR")
+    if not windir:
+        # Only fall back to the conventional location on Windows.
+        if os.name != "nt":
+            _SYSTEM_ROOTS_CACHE = []
+            return _SYSTEM_ROOTS_CACHE
+        windir = r"C:\Windows"
+
+    windows = Path(windir)
+    roots: list[str] = []
+    for name in ("System32", "SysWOW64", "WinSxS"):
+        candidate = windows / name
+        try:
+            roots.append(_normcase_normpath(candidate.resolve()))
+        except OSError:
+            roots.append(_normcase_normpath(candidate.absolute()))
+
+    _SYSTEM_ROOTS_CACHE = roots
+    return roots
+
+
 def is_system_dll(path: Path) -> bool:
     """
     Determine whether a dependency belongs to Windows system locations.
@@ -313,29 +365,9 @@ def is_system_dll(path: Path) -> bool:
     except OSError:
         resolved = path
 
-    windir = os.environ.get("WINDIR")
-    if not windir:
-        # Fall back to the conventional location, but only if we're on Windows.
-        if os.name != "nt":
-            return False
-        windir = r"C:\Windows"
-
-    windows = Path(windir)
-
-    system_dirs = [
-        windows / "System32",
-        windows / "SysWOW64",
-        windows / "WinSxS",
-    ]
-
     resolved_str = _normcase_normpath(resolved)
 
-    for system_dir in system_dirs:
-        try:
-            root = _normcase_normpath(system_dir.resolve())
-        except OSError:
-            root = _normcase_normpath(system_dir.absolute())
-
+    for root in _system_roots():
         if resolved_str == root:
             return True
         if resolved_str.startswith(root + os.sep):
@@ -437,13 +469,14 @@ def run_windeployqt(executable: Path, output_dir: Path, verbose: bool) -> bool:
         "--release",
         "--dir",
         str(output_dir),
-        str(executable),
     ]
 
     if verbose:
-        # windeployqt accepts --verbose (repeatable for higher levels);
-        # a single level keeps output readable.
-        command.insert(1, "--verbose")
+        # windeployqt requires a numeric value for --verbose (e.g., --verbose 2).
+        # Passing just "--verbose" causes an "Invalid value" error and exit code 1.
+        command.extend(["--verbose", "2"])
+        
+    command.append(str(executable))
 
     if verbose:
         info("Running: " + subprocess.list2cmdline(command))
@@ -469,8 +502,7 @@ def run_windeployqt(executable: Path, output_dir: Path, verbose: bool) -> bool:
 
     info("Qt deployment completed.")
     return True
-
-
+    
 # ---------------------------------------------------------------------------
 # Deployment
 # ---------------------------------------------------------------------------
@@ -508,12 +540,11 @@ def deploy(
             "ERROR: output directory resolves to the input directory. "
             "Choose a distinct output folder."
         )
-        return 2
+        return 6
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     section("Copying Executable")
-    copied_exe = output_dir / executable.name
     try:
         copy_file(
             executable,
@@ -525,12 +556,12 @@ def deploy(
     except (OSError, shutil.Error) as exc:
         warn(f"ERROR: failed to copy executable: {exc}")
         return 5
-    info(f"Destination: {copied_exe}")
+    info(f"Destination: {output_dir / executable.name}")
 
     section("Searching Dependencies")
 
     try:
-        raw_ldd = run_ldd(executable)
+        raw_ldd = run_ldd(executable, verbose=verbose)
     except RuntimeError as exc:
         warn(f"ERROR: {exc}")
         return 3
@@ -540,6 +571,7 @@ def deploy(
     info(f"Total dependencies found: {len(dependencies)}")
 
     copied = 0
+    already_present = 0
     skipped_system = 0
     missing = 0
     unresolved = 0
@@ -567,8 +599,9 @@ def deploy(
 
         if not force_system and is_system_dll(dll):
             skipped_system += 1
-            if verbose:
-                info(f"{progress} System DLL ignored: {strike(str(dll))}")
+            # Always show system DLLs, struck through, so users can see
+            # the full dependency list and what was intentionally skipped.
+            info(f"{progress} System DLL (skipped): {strike(str(dll))}")
             continue
 
         try:
@@ -581,12 +614,15 @@ def deploy(
             )
             if result is CopyResult.COPIED:
                 copied += 1
+            elif result is CopyResult.ALREADY_PRESENT:
+                already_present += 1
         except (OSError, shutil.Error) as exc:
             copy_failures += 1
             warn(f"{progress} COPY FAILED: {dll} ({exc})")
 
     section("Dependency Summary")
     info(f"Non-system DLLs copied : {copied}")
+    info(f"Already present        : {already_present}")
     info(f"System DLLs skipped    : {skipped_system}")
     info(f"Missing dependencies   : {missing}")
     info(f"Unresolved dependencies: {unresolved}")
@@ -640,7 +676,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        "-f",
         "--force-system-dlls",
         action="store_true",
         dest="force_system",
