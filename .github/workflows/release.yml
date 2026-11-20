@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - '[0-9]*'
+
   workflow_dispatch:
     inputs:
       tag:
@@ -18,11 +19,12 @@ jobs:
   build-release:
     name: Build portable CPLDD bundle
     runs-on: windows-latest
+
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -36,7 +38,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pyinstaller zstandard
 
-      - name: Build cpldd.exe with PyInstaller
+      - name: Build cpldd.exe
         shell: pwsh
         run: |
           python -m PyInstaller --clean --noconfirm cpldd_.spec
@@ -61,25 +63,36 @@ jobs:
         shell: pwsh
         run: |
           Copy-Item "dist/cpldd.exe" "package/cpldd.exe"
-          $expected = @("cpldd.exe", "cygpath.exe", "ldd.exe", "msys-2.0.dll")
+
+          $expected = @(
+            "cpldd.exe",
+            "cygpath.exe",
+            "ldd.exe",
+            "msys-2.0.dll"
+          )
+
           foreach ($file in $expected) {
             if (-not (Test-Path (Join-Path "package" $file))) {
               throw "Missing package file: $file"
             }
           }
+
           $actual = @(Get-ChildItem package -File | ForEach-Object Name | Sort-Object)
           $expectedSorted = @($expected | Sort-Object)
+
           if (Compare-Object $expectedSorted $actual) {
-            throw "Package directory does not contain exactly the four expected binaries."
+            throw "Unexpected files in package directory."
           }
+
           Compress-Archive -Path "package/*" -DestinationPath "cpldd.zip" -CompressionLevel Optimal
+
           python -c "import zipfile; z=zipfile.ZipFile('cpldd.zip'); expected={'cpldd.exe','cygpath.exe','ldd.exe','msys-2.0.dll'}; actual=set(z.namelist()); assert actual == expected, f'Unexpected ZIP contents: {actual}'; print('ZIP contents verified:', sorted(actual))"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
-          name: CPLDD ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: CPLDD ${{ github.event.inputs.tag || github.ref_name }}
           generate_release_notes: true
           overwrite_files: true
           fail_on_unmatched_files: true
