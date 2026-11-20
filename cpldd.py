@@ -26,6 +26,8 @@ Exit codes:
     4  One or more dependencies were missing.
     5  A file copy failed.
     6  Invalid output directory (e.g. resolves to the input directory).
+    7  windeployqt was found but Qt deployment failed.
+    8  Unresolved dependencies found while --strict was enabled.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ from __future__ import annotations
 import argparse
 import enum
 import hashlib
+import ntpath
 import os
 import re
 import shutil
@@ -70,6 +73,14 @@ class CopyResult(enum.Enum):
     COPIED = "copied"
     ALREADY_PRESENT = "already_present"
     SAME_FILE = "same_file"
+
+
+class QtDeployResult(enum.Enum):
+    """Outcome of an optional windeployqt invocation."""
+
+    SUCCESS = "success"
+    SKIPPED = "skipped"
+    FAILED = "failed"
 
 
 # ---------------------------------------------------------------------------
@@ -315,8 +326,8 @@ def parse_ldd_output(
 # ---------------------------------------------------------------------------
 
 def _normcase_normpath(path: Path | str) -> str:
-    """Normalize a path for case-insensitive, separator-insensitive compare."""
-    return os.path.normcase(os.path.normpath(str(path)))
+    """Normalize a Windows path independent of the host operating system."""
+    return ntpath.normcase(ntpath.normpath(str(path).replace("/", "\\")))
 
 
 _SYSTEM_ROOTS_CACHE: list[str] | None = None
@@ -454,13 +465,22 @@ def copy_file(
 # Qt deployment
 # ---------------------------------------------------------------------------
 
-def run_windeployqt(executable: Path, output_dir: Path, verbose: bool) -> bool:
-    """Run windeployqt if available. Return True when it ran successfully."""
+def run_windeployqt(
+    executable: Path,
+    output_dir: Path,
+    verbose: bool,
+) -> QtDeployResult:
+    """
+    Run windeployqt on the executable supplied by the caller.
+
+    A missing tool is an optional skip. If the tool exists but fails,
+    return FAILED so the overall deployment can report a non-zero status.
+    """
     windeployqt = shutil.which("windeployqt.exe") or shutil.which("windeployqt")
 
     if not windeployqt:
         info("windeployqt not found. Qt deployment skipped.")
-        return False
+        return QtDeployResult.SKIPPED
 
     # windeployqt expects the executable as a positional argument and the
     # output directory via --dir.
@@ -491,17 +511,17 @@ def run_windeployqt(executable: Path, output_dir: Path, verbose: bool) -> bool:
         )
     except subprocess.TimeoutExpired:
         warn("windeployqt timed out after 600s.")
-        return False
+        return QtDeployResult.FAILED
     except OSError as exc:
         warn(f"Unable to execute windeployqt: {exc}")
-        return False
+        return QtDeployResult.FAILED
 
     if result.returncode != 0:
         warn(f"windeployqt failed with exit code {result.returncode}.")
-        return False
+        return QtDeployResult.FAILED
 
     info("Qt deployment completed.")
-    return True
+    return QtDeployResult.SUCCESS
     
 # ---------------------------------------------------------------------------
 # Deployment
@@ -527,6 +547,7 @@ def deploy(
     no_qt: bool,
     verbose: bool,
     overwrite: bool,
+    strict: bool = False,
 ) -> int:
     executable = executable.resolve()
     output_dir = output_dir.resolve()
@@ -577,6 +598,13 @@ def deploy(
     unresolved = 0
     copy_failures = 0
 
+    # A flat deployment directory can contain only one file per basename.
+    # Track source paths so two different DLLs with the same name are never
+    # silently allowed to overwrite one another, even with --force-overwrite.
+    basename_sources: dict[str, Path] = {
+        executable.name.casefold(): executable
+    }
+
     for index, dep in enumerate(dependencies, start=1):
         progress = f"[{index}/{len(dependencies)}]"
 
@@ -604,6 +632,25 @@ def deploy(
             info(f"{progress} System DLL (skipped): {strike(str(dll))}")
             continue
 
+        basename_key = dll.name.casefold()
+        previous_source = basename_sources.get(basename_key)
+        if previous_source is not None:
+            try:
+                same_source = previous_source.resolve() == dll.resolve()
+            except OSError:
+                same_source = previous_source == dll
+
+            if not same_source:
+                copy_failures += 1
+                warn(
+                    f"{progress} DLL NAME COLLISION: {dll.name}\\n"
+                    f"    First source : {previous_source}\\n"
+                    f"    Second source: {dll}\\n"
+                    "    Both files cannot safely occupy the same flat "
+                    "deployment directory. Resolve this conflict manually."
+                )
+                continue
+
         try:
             result = copy_file(
                 dll,
@@ -612,6 +659,7 @@ def deploy(
                 verbose=verbose,
                 overwrite=overwrite,
             )
+            basename_sources[basename_key] = dll
             if result is CopyResult.COPIED:
                 copied += 1
             elif result is CopyResult.ALREADY_PRESENT:
@@ -629,9 +677,15 @@ def deploy(
     if copy_failures:
         info(f"Copy failures          : {copy_failures}")
 
+    qt_result = QtDeployResult.SKIPPED
     if not no_qt:
         section("Searching For Qt Dependencies")
-        run_windeployqt(executable, output_dir, verbose)
+        deployed_executable = output_dir / executable.name
+        qt_result = run_windeployqt(
+            deployed_executable,
+            output_dir,
+            verbose,
+        )
 
     section("Deployment Finished")
     info(f"Executable : {executable}")
@@ -644,6 +698,10 @@ def deploy(
         return 4
     if copy_failures:
         return 5
+    if qt_result is QtDeployResult.FAILED:
+        return 7
+    if strict and unresolved:
+        return 8
 
     return 0
 
@@ -696,6 +754,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "Return exit code 8 if one or more dependency paths remain "
+            "unresolved."
+        ),
+    )
+
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -723,6 +790,7 @@ def main() -> int:
     info(f"  Output             : {output_dir}")
     info(f"  Force system DLLs  : {'yes' if args.force_system else 'no'}")
     info(f"  Overwrite existing : {'yes' if args.overwrite else 'no'}")
+    info(f"  Strict checking    : {'yes' if args.strict else 'no'}")
     info()
 
     return deploy(
@@ -732,6 +800,7 @@ def main() -> int:
         no_qt=args.no_qt,
         verbose=args.verbose,
         overwrite=args.overwrite,
+        strict=args.strict,
     )
 
 
