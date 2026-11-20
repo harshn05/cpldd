@@ -1,4 +1,3 @@
-
 # -*- mode: python ; coding: utf-8 -*-
 
 # ============================================================
@@ -6,15 +5,13 @@
 # Portable Windows DLL Deployment Helper
 #
 # Build:
-#   python -m PyInstaller --clean --noconfirm cpldd.spec
+#   python -m PyInstaller --clean --noconfirm cpldd_.spec
 #
 # Output:
 #   dist/cpldd.exe
 # ============================================================
 
 from pathlib import Path
-
-block_cipher = None
 
 # ------------------------------------------------------------
 # Project paths
@@ -59,7 +56,6 @@ a = Analysis(
 pyz = PYZ(
     a.pure,
     a.zipped_data,
-    cipher=block_cipher,
 )
 
 # ------------------------------------------------------------
@@ -98,4 +94,7 @@ exe = EXE(
     # Code signing (disabled)
     codesign_identity=None,
     entitlements_file=None,
+    
+    # Optional: Add an icon if you have one in the root directory
+    # icon=str(PROJECT_DIR / "cpldd.ico"),
 )
