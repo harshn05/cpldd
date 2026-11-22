@@ -1,3 +1,7 @@
+[![Tests](https://github.com/harshn05/cpldd/actions/workflows/tests.yml/badge.svg?branch=master)](https://github.com/harshn05/cpldd/actions/workflows/tests.yml)
+[![Latest release](https://img.shields.io/github/v/release/harshn05/cpldd)](https://github.com/harshn05/cpldd/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
+
 # CPLDD
 
 **Portable Windows DLL Deployment Helper**
