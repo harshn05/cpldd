@@ -27,4 +27,4 @@ and the documentation in this repository).
 
 The release bundle (`cpldd.zip`) also contains third-party programs that are
 **not** covered by this license and are distributed under their own terms.
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
