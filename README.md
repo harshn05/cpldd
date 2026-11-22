@@ -1,151 +1,180 @@
 # CPLDD
 
-CPLDD is a lightweight Windows DLL deployment utility for Qt and non-Qt C/C++ applications.
+**Portable Windows DLL Deployment Helper**
 
-It analyzes the DLL dependencies reported by `ldd`, then copies the input executable and its required non-system DLL dependencies into a deployment directory. For Qt applications, CPLDD can also invoke `windeployqt` to deploy the Qt runtime, plugins, and other Qt-related files.
+CPLDD is a lightweight Windows utility for deploying Qt and non-Qt C/C++ applications with their required non-system DLL dependencies.
 
-The original CPLDD was written in Python and has been modernized for Python 3.12+ and portable development environments such as WinDev.
+It analyzes dependencies reported by `ldd`, converts MSYS2/Cygwin paths into native Windows paths, and copies the input executable and its resolved non-system DLL dependencies into a deployment directory. For Qt applications, CPLDD can also invoke `windeployqt` to deploy Qt runtime libraries, plugins, and other Qt-related files.
+
+CPLDD is written in Python and can be run with Python 3.12+ or distributed as a standalone Windows executable. The standalone release is packaged with the MSYS2 runtime tools needed for dependency discovery and path conversion.
 
 ## Features
 
-- Deploys Qt and non-Qt Windows C/C++ executables.
-- Uses `ldd` from the currently active environment to discover DLL dependencies.
-- Converts MSYS/Cygwin-style paths to native Windows paths using `cygpath` when available, with common drive-path fallbacks.
-- Skips Windows system DLLs from `System32`, `SysWOW64`, and `WinSxS` by default.
-- Copies non-system runtime DLLs alongside the executable.
-- Runs `windeployqt` when Qt Core is detected and the tool is available. Use `--force-qt` to run it when Qt is loaded dynamically.
-- Reports missing, unresolved, and conflicting dependencies.
-- Supports executable and output paths containing spaces.
-- Detects DLL basename collisions instead of silently overwriting one dependency with another.
-- Supports multiple compiler/runtime environments, provided the required tools and DLLs are visible to the active environment.
+- Deploys Qt and non-Qt Windows C/C++ applications.
+- Discovers DLL dependencies through the active environment's `ldd`.
+- Converts MSYS2/Cygwin paths to native Windows paths.
+- Skips Windows system DLLs by default, with an option to include them.
+- Copies resolved non-system DLLs and reports missing or unresolved dependencies.
+- Detects DLL filename collisions and protects existing destination DLLs.
+- Integrates with `windeployqt` for Qt runtime deployment.
+- Supports strict checking, verbose diagnostics, and automation-friendly exit codes.
+
+## Download
+
+Download the latest standalone bundle from the [GitHub Releases page](https://github.com/harshn05/cpldd/releases/latest).
+
+### Release bundle contents
+
+The release ZIP contains exactly these four files:
+
+```text
+cpldd/
+├── cpldd.exe
+├── cygpath.exe
+├── ldd.exe
+└── msys-2.0.dll
+```
+
+| File | Purpose |
+|---|---|
+| `cpldd.exe` | Standalone CPLDD application built with PyInstaller. |
+| `ldd.exe` | MSYS2 dependency inspection utility used to identify the executable's DLL dependencies. |
+| `cygpath.exe` | MSYS2 path conversion utility used to convert MSYS paths into native Windows paths. |
+| `msys-2.0.dll` | MSYS2 runtime library required by the bundled MSYS2 tools. |
+
+Keep all four files together in the extracted release directory. Do not remove or rename the bundled runtime files.
+
+**Important:** The bundled `ldd.exe`, `cygpath.exe`, and `msys-2.0.dll` provide the MSYS2 runtime tooling used by the release. They do not bundle every compiler runtime DLL required by every application you deploy. CPLDD still uses the active environment and its available DLL search paths to resolve application dependencies.
+
+The optional Qt deployment tool, `windeployqt`, is not included in this ZIP. It must be available on `PATH` from the Qt environment you want to use.
 
 ## Requirements
 
-CPLDD is intended to run on Windows from a shell where the required deployment tools and runtime DLL dependencies are available on `PATH`.
+### Running the standalone release
 
-The tools used are:
+- Windows 10 or Windows 11.
+- Extract all four files from the release ZIP into the same directory.
+- Make `ldd.exe` available on `PATH`, or run CPLDD from a shell where it is discoverable. CPLDD also checks for `cygpath.exe` beside the resolved `ldd.exe`, so adding the extracted release directory to `PATH` makes both tools available cleanly.
+- Make the application's compiler/runtime DLL directories available to the active environment so `ldd` can resolve them.
 
-| Tool | Purpose | Required |
-|---|---|---|
-| `ldd` | Dependency discovery | Yes |
-| `cygpath` | MSYS/Cygwin path conversion | No, but recommended |
-| `windeployqt` | Qt runtime deployment | Only for Qt deployment |
+### Running from source
 
-CPLDD itself can be run with Python 3.12+ or packaged as a standalone Windows executable.
+- Windows.
+- Python 3.12 or newer.
+- An active MSYS2/Cygwin-style environment providing `ldd`.
+- `cygpath` is recommended for full path conversion support. CPLDD has a fallback for common drive-letter path formats such as `/c/...` and `/cygdrive/c/...`.
 
-> **Important:** CPLDD relies on the active `ldd` environment. It does not independently search every directory on the machine or discover DLLs that are unavailable to that environment. Load the compiler/runtime environment used by the application before running CPLDD.
+### Qt applications
+
+For Qt deployment, `windeployqt` must be available on `PATH`. CPLDD detects Qt Core dependencies and invokes the available `windeployqt` automatically unless `--no-qt` is used.
+
+## Installation and setup
+
+### Option 1: Standalone executable
+
+1. Download the latest ZIP from [GitHub Releases](https://github.com/harshn05/cpldd/releases/latest).
+2. Extract all four files into a directory, for example `C:\Tools\CPLDD`.
+3. Add that directory to your `PATH`, or open a shell in that directory.
+4. Load the compiler/runtime environment used to build your application.
+5. Run `cpldd.exe` against your executable.
+
+Example:
+
+```powershell
+cpldd.exe MyApplication.exe
+```
+
+The release includes the MSYS2 `ldd` and `cygpath` tools and their runtime library. You do not need to install a separate Python runtime to launch the standalone `cpldd.exe`.
+
+### Option 2: Run using Python
+
+Clone the repository:
+
+```powershell
+git clone https://github.com/harshn05/cpldd.git
+cd cpldd
+```
+
+Run:
+
+```powershell
+python cpldd.py --help
+```
+
+The main Python script uses only the Python standard library. The standalone release build uses PyInstaller and the packaging workflow uses zstandard to prepare the MSYS2 runtime bundle.
 
 ## Command-line usage
 
-### Python
+### Syntax
 
-```powershell
-python cpldd.py <Input_Exe_File> [Output_Folder]
+```text
+cpldd [options] <Input_Exe_File> [Output_Folder]
 ```
 
-### Standalone executable
+With Python:
 
 ```powershell
-cpldd.exe <Input_Exe_File> [Output_Folder]
+python cpldd.py MyApplication.exe
 ```
 
-The output folder is optional. If omitted, CPLDD creates a directory next to the executable using the executable's name with a `_deploy` suffix.
+With the standalone release:
+
+```powershell
+cpldd.exe MyApplication.exe
+```
+
+The output folder is optional. If omitted, CPLDD creates a directory next to the input executable using the executable's stem plus the `_deploy` suffix.
 
 For example:
 
 ```text
-myapp.exe
-```
-
-creates:
-
-```text
-myapp_deploy/
-└── myapp.exe
-    ...
+MyApplication.exe
+MyApplication_deploy/
 ```
 
 To specify an output directory:
 
 ```powershell
-cpldd.exe myapp.exe deploy
+cpldd.exe MyApplication.exe release
 ```
 
-## Options
+### Arguments
 
-### `--force-system-dlls`
+| Argument | Description |
+|---|---|
+| `<inputexe>` | Input Windows executable (required). |
+| `[outputfolder]` | Optional deployment directory. Defaults to `<exe-stem>_deploy` next to the input executable. |
 
-Copy Windows system DLLs from `System32`, `SysWOW64`, and `WinSxS` into the deployment directory.
+### Options
 
-```powershell
-cpldd.exe myapp.exe --force-system-dlls
-```
+| Option | Description |
+|---|---|
+| `--force-system-dlls` | Also copy DLLs from Windows system directories. |
+| `--force-overwrite` | Overwrite existing destination DLLs when their contents differ. The executable itself is always refreshed. |
+| `--no-qt` | Do not run `windeployqt`. |
+| `--force-qt` | Run `windeployqt` even if no Qt Core dependency is detected. |
+| `--windeployqt-arg=ARG` | Pass an additional argument to `windeployqt`. Can be repeated. |
+| `--strict` | Return exit code `8` if one or more dependency paths remain unresolved. |
+| `-v`, `--verbose` | Show additional diagnostic information. |
+| `-h`, `--help` | Display command-line help. |
 
-System DLLs are skipped by default. Copying Windows-owned components is normally undesirable, so use this option only when you have a specific reason.
+### Exit codes
 
-### `--force-overwrite`
+| Code | Meaning |
+|---:|---|
+| `0` | Success. |
+| `2` | Input executable not found. |
+| `3` | `ldd` failed or reported no dependencies. |
+| `4` | One or more dependencies were missing. |
+| `5` | A file copy failed. |
+| `6` | Invalid or unusable output directory. |
+| `7` | `windeployqt` was found but Qt deployment failed. |
+| `8` | Unresolved dependencies found while `--strict` was enabled. |
+| `64` | Command-line usage error. |
 
-Overwrite an existing destination DLL when its contents differ from the source.
+If several problems occur, CPLDD reports all of them and returns the first applicable error code in the order shown above.
 
-```powershell
-cpldd.exe myapp.exe --force-overwrite
-```
-
-By default, CPLDD does not silently replace a different DLL already present in the output directory. Identical files are treated as already present.
-
-The executable itself is always refreshed, so rebuilding the application and running CPLDD again updates the deployed executable without requiring this option.
-
-This option does not bypass DLL basename-collision detection. Two different source DLLs with the same filename cannot safely occupy the same flat deployment directory.
-
-### `--no-qt`
-
-Disable the `windeployqt` step, even when Qt dependencies are detected.
-
-```powershell
-cpldd.exe myapp.exe --no-qt
-```
-
-### `--force-qt`
-
-Run `windeployqt` even if no Qt Core library appears in the dependency list. This is useful when the application loads Qt dynamically.
-
-```powershell
-cpldd.exe myapp.exe --force-qt
-```
-
-If `windeployqt` is not available on `PATH`, Qt deployment is skipped.
-
-### `--windeployqt-arg ARG`
-
-Pass additional arguments to `windeployqt`. This option can be repeated.
-
-```powershell
-cpldd.exe myapp.exe --windeployqt-arg=--debug --windeployqt-arg=--qmldir=qml
-```
-
-Use the `=` form when the argument value itself begins with a hyphen.
-
-CPLDD does not force `--release` or `--debug`; `windeployqt` determines the build type from the executable unless you explicitly pass an override.
-
-### `--strict`
-
-Return exit code `8` if one or more dependency paths remain unresolved.
-
-```powershell
-cpldd.exe myapp.exe --strict
-```
-
-Without `--strict`, unresolved paths are reported but do not, by themselves, cause a non-zero exit code. Missing dependencies are still treated as an error.
-
-### `-v`, `--verbose`
-
-Enable additional diagnostic output.
-
-```powershell
-cpldd.exe myapp.exe --verbose
-```
-
-## Examples
+### Examples
 
 Deploy using the default output directory:
 
@@ -159,7 +188,19 @@ Deploy into a custom directory:
 cpldd.exe MyApplication.exe release
 ```
 
-Deploy without Qt handling:
+Include Windows system DLLs:
+
+```powershell
+cpldd.exe MyApplication.exe --force-system-dlls
+```
+
+Overwrite existing destination DLLs when their contents differ:
+
+```powershell
+cpldd.exe MyApplication.exe release --force-overwrite
+```
+
+Skip Qt deployment:
 
 ```powershell
 cpldd.exe MyApplication.exe --no-qt
@@ -171,6 +212,20 @@ Force Qt deployment, for example when Qt is loaded dynamically:
 cpldd.exe MyApplication.exe --force-qt
 ```
 
+Pass additional arguments to `windeployqt`:
+
+```powershell
+cpldd.exe MyApplication.exe --windeployqt-arg=--qmldir=qml
+```
+
+Multiple arguments can be supplied:
+
+```powershell
+cpldd.exe MyApplication.exe --force-qt --windeployqt-arg=--qmldir=qml --windeployqt-arg=--debug
+```
+
+Use the `=` form when an argument value itself begins with a hyphen.
+
 Enable strict dependency checking and verbose diagnostics:
 
 ```powershell
@@ -179,32 +234,43 @@ cpldd.exe MyApplication.exe --strict --verbose
 
 ## How it works
 
-1. CPLDD runs `ldd` against the input executable.
-2. It parses the dependency list and converts reported paths to Windows paths.
-3. Windows system DLLs are skipped by default.
-4. Resolved non-system DLLs are copied into the deployment directory.
-5. If Qt Core is detected, CPLDD runs `windeployqt` when it is available. `--force-qt` can request this step explicitly.
+### 1. Dependency discovery
 
-Dependency discovery happens before the output directory is created. If `ldd` fails or reports no usable dependencies, CPLDD exits without creating a partial deployment directory.
+CPLDD invokes `ldd` against the input executable and parses its output.
 
-The active shell environment matters. For example, when deploying a MinGW executable, run CPLDD from an environment where the relevant MinGW runtime DLLs and `ldd` are available.
+Dependencies are classified as:
 
-## Output directory behaviour
+- **Resolved:** A dependency path was converted to a native Windows path.
+- **Unresolved:** A path was reported but could not be converted.
+- **Not found:** `ldd` explicitly reported `not found`.
 
-CPLDD creates the output directory if it does not exist. If the directory already exists, it reuses it.
+MSYS2/Cygwin `ldd` may return a non-zero exit code while still providing useful dependency information, for example when one dependency is missing. CPLDD parses usable output and reports missing dependencies separately.
 
-- The executable is always refreshed.
-- An identical DLL already in the destination is left in place.
-- A different DLL with the same destination filename is not overwritten unless `--force-overwrite` is used.
-- Different source DLLs with the same basename are reported as a collision and are not silently substituted.
+### 2. Path conversion
 
-**CPLDD does not clean the output directory before deployment.** DLLs left over from an earlier deployment are not automatically deleted if they are no longer dependencies of the current executable. If you need a clean deployment, remove or empty the output directory before running CPLDD.
+CPLDD converts MSYS2/Cygwin paths into native Windows paths.
 
-## System DLL handling
+For example:
 
-CPLDD avoids copying Windows-owned system components by default.
+```text
+/c/WinDev/mingw64/bin/libgcc_s_seh-1.dll
+```
 
-The following locations are treated as system locations:
+becomes:
+
+```text
+C:/WinDev/mingw64/bin/libgcc_s_seh-1.dll
+```
+
+CPLDD uses batched `cygpath` conversion to reduce process creation overhead. It uses binary input/output and strict UTF-8 decoding to avoid Windows text-mode newline translation and encoding ambiguity.
+
+If batch conversion fails or produces malformed output, CPLDD retries eligible paths individually. If `cygpath` is unavailable or a conversion still fails, common drive-letter formats are handled by a fallback converter.
+
+Input paths are not whitespace-stripped during conversion, so the conversion layer does not silently alter leading or trailing whitespace.
+
+### 3. System DLL filtering
+
+By default, DLLs located in these Windows directories are skipped:
 
 ```text
 %WINDIR%\System32
@@ -212,38 +278,46 @@ The following locations are treated as system locations:
 %WINDIR%\WinSxS
 ```
 
-This avoids unnecessarily bundling Windows components such as `KERNEL32.dll` or `COMCTL32.dll` when `ldd` resolves them from the Windows installation.
+Use `--force-system-dlls` to include them. Copying Windows-owned components is normally unnecessary, so use this option only when there is a specific reason.
 
-Use `--force-system-dlls` only when system DLL deployment is explicitly required.
+### 4. Executable and DLL deployment
 
-## Qt deployment
+CPLDD creates the destination directory after dependency discovery succeeds.
 
-CPLDD detects Qt by looking for a Qt Core dependency, such as `Qt6Core.dll` or `Qt5Core.dll`.
+- The executable is copied and refreshed on each deployment.
+- Identical DLLs already in the destination are left in place.
+- Different destination DLLs are not overwritten unless `--force-overwrite` is used.
+- Different source DLLs with the same basename are reported as a collision, even with `--force-overwrite`.
 
-When Qt Core is detected and `windeployqt` is available on `PATH`, CPLDD invokes it for the copied executable in the deployment directory. This allows `windeployqt` to deploy the relevant Qt runtime files and plugins.
+CPLDD uses a flat deployment directory, so two different DLLs with the same filename cannot safely occupy it under the same name. The output directory is created if it does not exist and reused if it already exists.
+
+> **Note:** CPLDD does not clean the output directory before deployment. Files left over from an earlier deployment are not automatically removed when they are no longer dependencies of the current executable. For a clean deployment, remove or empty the output directory before running CPLDD.
+
+### 5. Qt deployment
+
+If a Qt Core dependency is detected and `windeployqt` is available, CPLDD invokes it for the executable in the deployment directory.
 
 - Non-Qt applications skip this step.
 - Use `--force-qt` if Qt is loaded dynamically and is not visible in the `ldd` dependency list.
 - Use `--no-qt` to disable Qt deployment.
-- Use `--windeployqt-arg` to pass additional arguments to `windeployqt`.
+- Use `--windeployqt-arg` to pass additional arguments.
 
-If `windeployqt` is unavailable, the Qt deployment step is skipped. If it is found but fails, CPLDD reports the failure and returns exit code `7` unless an earlier error takes precedence.
+CPLDD does not force `--release` or `--debug`; `windeployqt` determines the build type unless an override is explicitly passed.
 
-## Exit codes
+If `windeployqt` is unavailable, Qt deployment is skipped. If it is found but fails, CPLDD reports the failure.
 
-| Code | Meaning |
-|---:|---|
-| `0` | Success. |
-| `2` | Input executable not found. |
-| `3` | `ldd` failed or reported no dependencies. |
-| `4` | One or more dependencies were missing. |
-| `5` | A file copy failed, including a DLL basename collision. |
-| `6` | Invalid or unusable output directory. |
-| `7` | `windeployqt` was found but Qt deployment failed. |
-| `8` | Unresolved dependencies found while `--strict` was enabled. |
-| `64` | Command-line usage error. |
+### 6. Final report
 
-When several problems occur, CPLDD reports all detected problems and returns the first applicable error code in the order shown above.
+CPLDD displays a summary containing:
+
+- Non-system DLLs copied.
+- DLLs already present.
+- System DLLs skipped.
+- Missing dependencies.
+- Unresolved dependencies.
+- Copy failures and basename collisions.
+
+When multiple problems occur, all detected problems are reported and the first applicable error code is returned.
 
 ## MSVC runtime note
 
@@ -251,20 +325,16 @@ On a machine with the Visual C++ Redistributable installed, runtime DLLs such as
 
 An MSVC application deployed to a machine without the required Visual C++ runtime may fail to start. Install the appropriate Microsoft Visual C++ Redistributable on the target machine, or deliberately include the required runtime DLLs alongside the executable where licensing and deployment requirements permit.
 
-## Dependency resolution model
+## Dependency resolution and toolchains
 
-CPLDD uses the dependency information available through the active `ldd` environment. It does not replace the Windows loader and does not independently search every directory on the machine.
+CPLDD relies on the dependency information available through the active `ldd` environment. It does not replace the Windows loader and does not independently search every directory on the machine. It may not discover DLLs loaded dynamically at runtime.
 
 For best results:
 
 1. Load the compiler/runtime environment used to build the application.
 2. Make sure the required runtime DLLs are visible to that environment.
-3. Run the executable from that environment and check that it starts without DLL load failures.
-4. Run CPLDD from the same environment.
-
-This model is particularly useful with portable development environments such as WinDev, where the active toolchain determines which runtime DLLs are visible to `ldd`.
-
-## Compiler toolchains
+3. Run CPLDD from the same environment.
+4. Test the deployed application on a clean Windows machine.
 
 CPLDD is designed to work with different Windows C/C++ compiler environments, including:
 
@@ -274,33 +344,19 @@ CPLDD is designed to work with different Windows C/C++ compiler environments, in
 - Cygwin
 - Clang-based environments
 
-CPLDD does not select or configure a compiler toolchain. It works with the dependency environment that is active when it is launched.
+CPLDD does not select or configure a compiler toolchain. The active environment determines which tools and runtime DLLs are visible to `ldd`.
 
-For example, a WinDev MinGW environment should expose `ldd` and the relevant MinGW runtime DLLs on its `PATH`. A Clang/MSVC environment should expose the corresponding LLVM/MSVC runtime dependencies and the required `ldd` tool.
+## Limitations
 
-## Standalone deployment
-
-CPLDD can be packaged as a standalone Windows executable, so a separate Python installation is not required to launch CPLDD.
-
-A typical WinDev layout is:
-
-```text
-WinDev/
-└── Programs/
-    └── cpldd.exe
-```
-
-Once `Programs` is on `PATH`, invoke it directly:
-
-```powershell
-cpldd myapp.exe
-```
-
-The standalone CPLDD executable still relies on `ldd`, `cygpath`, and the optional `windeployqt` available in the active shell environment. Packaging CPLDD itself does not bundle or replace those external tools.
+- Dynamically loaded dependencies may not appear in `ldd` output.
+- Qt deployment requires a compatible `windeployqt` available on `PATH`.
+- Unresolved dependency paths may require manual investigation.
+- A successful dependency copy does not guarantee that the application has no additional runtime, plugin, data-file, or configuration requirements.
+- Final validation on a clean Windows machine is recommended.
 
 ## Sample output
 
-The following is illustrative. Exact paths, dependency counts, and messages vary by application and environment.
+The following output is illustrative. Paths, dependency counts, and messages vary by application and environment.
 
 ```text
 ============================================================
@@ -330,21 +386,16 @@ Already present        : 0
 System DLLs skipped    : 9
 Missing dependencies   : 0
 Unresolved dependencies: 0
+
+============================================================
+ Searching For Qt Dependencies
+============================================================
+Qt deployment completed.
+
+============================================================
+ Deployment Finished
+============================================================
 ```
-
-## Original use case
-
-CPLDD was originally developed to simplify deployment of complex C++ applications containing dependencies such as:
-
-- Qt
-- VTK
-- ITK
-- OpenBLAS
-- muParser
-- Armadillo
-- tinyxml2
-
-The same approach remains useful for modern portable development environments and applications with substantial native dependency trees.
 
 ## Tests
 
@@ -360,11 +411,48 @@ Or use unittest discovery:
 python -m unittest discover -s tests -v
 ```
 
-The tests mock `ldd`, `cygpath`, and `windeployqt`, so the test suite does not require those external tools to be installed.
+The unit tests mock `ldd`, `cygpath`, and `windeployqt`, so they do not require those external tools.
 
-## Download
+For integration testing, use actual Windows executables and the MSYS2 runtime tools. Test the resulting deployment directory on a clean Windows environment to identify dependencies that may not be visible to static dependency inspection.
 
-Download the latest standalone binaries from the [GitHub Releases page](https://github.com/harshn05/cpldd/releases/latest).
+## Build and release packaging
+
+The standalone executable is built with PyInstaller using `cpldd_.spec`.
+
+The release workflow:
+
+1. Sets up Python 3.12 on Windows.
+2. Installs PyInstaller and zstandard.
+3. Builds `cpldd.exe` and performs a `--help` smoke test.
+4. Downloads the latest x86_64 MSYS2 runtime package.
+5. Verifies the downloaded package against its SHA-256 checksum.
+6. Extracts `cygpath.exe`, `ldd.exe`, and `msys-2.0.dll`.
+7. Assembles and validates a ZIP containing exactly the four release files.
+8. Publishes the ZIP as a GitHub Actions artifact and attaches it to tagged GitHub Releases.
+
+The MSYS2 runtime tools are fetched from the official [MSYS2 package page](https://packages.msys2.org/packages/msys2-runtime). The release ZIP contains the three extracted runtime files plus the standalone CPLDD executable.
+
+## Original use case
+
+CPLDD was originally developed to simplify deployment of complex C++ applications with dependency trees involving libraries such as:
+
+- Qt
+- VTK
+- ITK
+- OpenBLAS
+- muParser
+- Armadillo
+- tinyxml2
+
+The same approach remains useful for portable development environments and applications with substantial native dependency trees.
+
+## Project
+
+**Author:** Harsh Kumar Narula
+
+**Repository:** [github.com/harshn05/cpldd](https://github.com/harshn05/cpldd)
+
+**Releases:** [Download the latest CPLDD release](https://github.com/harshn05/cpldd/releases/latest)
 
 ## License
 
