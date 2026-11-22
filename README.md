@@ -456,4 +456,7 @@ The same approach remains useful for portable development environments and appli
 
 ## License
 
-See the repository's `LICENSE` file for the licensing terms of CPLDD.
+CPLDD is released under the MIT License. See [LICENSE.md](LICENSE.md).
+
+The release bundle (`cpldd.zip`) also contains `ldd.exe`, `cygpath.exe` and `msys-2.0.dll` from the [MSYS2](https://www.msys2.org/) runtime, which are licensed under the GPL, and a Python runtime inside `cpldd.exe`. These are not covered by the MIT License. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details and source-code locations.
+
