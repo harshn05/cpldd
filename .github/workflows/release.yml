@@ -60,11 +60,19 @@ jobs:
         run: |
           Copy-Item "dist/cpldd.exe" "package/cpldd.exe"
 
+          # License files are required: the bundled MSYS2 tools are GPL-licensed.
+          Copy-Item "LICENSE.md" "package/LICENSE.md"
+          Copy-Item "THIRD-PARTY-NOTICES.md" "package/THIRD-PARTY-NOTICES.md"
+          Copy-Item "GPL-3.0.txt" "package/GPL-3.0.txt"
+
           $expected = @(
             "cpldd.exe",
             "cygpath.exe",
             "ldd.exe",
-            "msys-2.0.dll"
+            "msys-2.0.dll",
+            "LICENSE.md",
+            "THIRD-PARTY-NOTICES.md",
+            "GPL-3.0.txt"
           )
 
           foreach ($file in $expected) {
@@ -81,7 +89,7 @@ jobs:
           $expectedSorted = @($expected | Sort-Object)
 
           if (Compare-Object $expectedSorted $actual) {
-            throw "Package directory does not contain exactly the four expected binaries."
+            throw "Package directory does not contain exactly the expected files."
           }
 
           Compress-Archive `
@@ -89,7 +97,7 @@ jobs:
             -DestinationPath "cpldd.zip" `
             -CompressionLevel Optimal
 
-          python -c "import zipfile; z=zipfile.ZipFile('cpldd.zip'); expected={'cpldd.exe','cygpath.exe','ldd.exe','msys-2.0.dll'}; actual=set(z.namelist()); assert actual == expected, f'Unexpected ZIP contents: {actual}'; print('ZIP contents verified:', sorted(actual))"
+          python -c "import zipfile; z=zipfile.ZipFile('cpldd.zip'); expected={'cpldd.exe','cygpath.exe','ldd.exe','msys-2.0.dll','LICENSE.md','THIRD-PARTY-NOTICES.md','GPL-3.0.txt'}; actual=set(z.namelist()); assert actual == expected, f'Unexpected ZIP contents: {actual}'; print('ZIP contents verified:', sorted(actual))"
 
       - name: Upload ZIP as workflow artifact
         uses: actions/upload-artifact@v4
