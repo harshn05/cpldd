@@ -17,30 +17,38 @@ Typical usage:
     cpldd myapp.exe --force-system-dlls
     cpldd myapp.exe --force-overwrite
     cpldd myapp.exe --no-qt
+    cpldd myapp.exe --force-qt --windeployqt-arg=--qmldir=qml
     cpldd myapp.exe --verbose
 
 Exit codes:
-    0  Success.
-    2  Input executable not found.
-    3  ldd failed or produced no usable output.
-    4  One or more dependencies were missing.
-    5  A file copy failed.
-    6  Invalid output directory (e.g. resolves to the input directory).
-    7  windeployqt was found but Qt deployment failed.
-    8  Unresolved dependencies found while --strict was enabled.
+    0   Success.
+    2   Input executable not found.
+    3   ldd failed or reported no dependencies.
+    4   One or more dependencies were missing.
+    5   A file copy failed.
+    6   Invalid or unusable output directory.
+    7   windeployqt was found but Qt deployment failed.
+    8   Unresolved dependencies found while --strict was enabled.
+    64  Command-line usage error.
+
+When several problems occur, all of them are listed at the end of the run
+and the exit code of the first one (in the order above) is returned.
 """
 
 from __future__ import annotations
 
 import argparse
 import enum
-import hashlib
+import filecmp
+import functools
 import ntpath
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -48,6 +56,20 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
+
+class ExitCode(enum.IntEnum):
+    """Process exit codes (see the module docstring)."""
+
+    OK = 0
+    EXE_NOT_FOUND = 2
+    LDD_FAILED = 3
+    MISSING_DEPS = 4
+    COPY_FAILED = 5
+    BAD_OUTPUT_DIR = 6
+    QT_FAILED = 7
+    UNRESOLVED = 8
+    USAGE = 64
+
 
 class DepStatus(str, enum.Enum):
     """Classification of a single ldd-reported dependency."""
@@ -87,8 +109,42 @@ class QtDeployResult(enum.Enum):
 # Console helpers
 # ---------------------------------------------------------------------------
 
+def configure_console() -> None:
+    """
+    Make console output robust against unencodable characters.
+
+    When stdout/stderr are redirected on Windows they use the locale code
+    page (e.g. cp1252), which cannot encode every character in a path.
+    Replace such characters instead of crashing mid-deployment.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
+def _stdout_can_encode(text: str) -> bool:
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        text.encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
+
+
 def strike(text: str) -> str:
-    """Return text with a Unicode strike-through overlay."""
+    """
+    Return text with a Unicode strike-through overlay.
+
+    Falls back to the plain text when the output encoding cannot represent
+    the combining character (legacy code pages when output is redirected).
+    """
+    if not _stdout_can_encode("\u0336"):
+        return text
     return "".join(f"{char}\u0336" for char in text)
 
 
@@ -116,43 +172,8 @@ _CYGDRIVE_RE = re.compile(r"^/cygdrive/([A-Za-z])/(.*)$")
 _MSYS_DRIVE_RE = re.compile(r"^/([A-Za-z])/(.*)$")
 
 
-def cygpath_to_windows(path: str) -> Path | None:
-    """
-    Convert an MSYS/Cygwin path to a native Windows path.
-
-    Supports paths such as:
-        /cygdrive/c/foo/bar.dll
-        /c/foo/bar.dll
-
-    `cygpath -m` is used when available because it handles the active
-    MSYS/Cygwin environment correctly.
-    """
-    path = path.strip()
-
-    if not path or path in {"?", "??"}:
-        return None
-
-    # Already a native Windows path.
-    if _WINDOWS_DRIVE_RE.match(path):
-        return Path(path)
-
-    cygpath = shutil.which("cygpath")
-    if cygpath:
-        try:
-            result = subprocess.run(
-                [cygpath, "-m", path],
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=10,
-            )
-            converted = result.stdout.strip()
-            if converted:
-                return Path(converted)
-        except (OSError, subprocess.SubprocessError):
-            pass
-
-    # Fallback for common MSYS/Cygwin formats.
+def _fallback_windows_path(path: str) -> Path | None:
+    """Convert common MSYS/Cygwin drive-letter paths without cygpath."""
     match = _CYGDRIVE_RE.match(path)
     if match:
         return Path(f"{match.group(1).upper()}:/{match.group(2)}")
@@ -162,6 +183,86 @@ def cygpath_to_windows(path: str) -> Path | None:
         return Path(f"{match.group(1).upper()}:/{match.group(2)}")
 
     return None
+
+
+def _cygpath_batch(paths: list[str]) -> list[str | None]:
+    """Convert many MSYS/Cygwin paths with one cygpath process.
+
+    Uses UTF-8 explicitly and preserves input order. Returns one None per
+    input if cygpath is unavailable, fails, or produces ambiguous output.
+    """
+    if not paths:
+        return []
+
+    failed: list[str | None] = [None] * len(paths)
+
+    # -f consumes newline-delimited input, so embedded newlines are ambiguous.
+    if any("\n" in path or "\r" in path for path in paths):
+        return failed
+
+    cygpath = shutil.which("cygpath")
+    if not cygpath:
+        return failed
+
+    try:
+        result = subprocess.run(
+            [cygpath, "-C", "UTF8", "-m", "-f", "-"],
+            input="\n".join(paths) + "\n",
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            check=True,
+            timeout=30,
+        )
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        return failed
+
+    # Do not strip: whitespace may be part of a valid path component.
+    lines = result.stdout.splitlines()
+    if len(lines) != len(paths):
+        return failed
+
+    return [line if line else None for line in lines]
+
+
+def convert_paths(paths: Iterable[str]) -> dict[str, Path | None]:
+    """
+    Convert MSYS/Cygwin paths to native Windows paths.
+
+    Supports paths such as ``/cygdrive/c/foo/bar.dll`` and ``/c/foo/bar.dll``.
+    ``cygpath`` is used when available (one process for the whole batch)
+    because it handles the active MSYS/Cygwin environment correctly; the
+    drive-letter regexes are only a fallback.
+
+    The result maps each (whitespace-stripped) input path to its Windows
+    path, or ``None`` if it could not be converted.
+    """
+    result: dict[str, Path | None] = {}
+    pending: list[str] = []
+
+    for raw in dict.fromkeys(p.strip() for p in paths):
+        if not raw or raw in {"?", "??"}:
+            result[raw] = None
+        elif _WINDOWS_DRIVE_RE.match(raw):
+            # Already a native Windows path.
+            result[raw] = Path(raw)
+        else:
+            pending.append(raw)
+
+    if pending:
+        for raw, converted in zip(pending, _cygpath_batch(pending)):
+            if converted:
+                result[raw] = Path(converted)
+            else:
+                result[raw] = _fallback_windows_path(raw)
+
+    return result
+
+
+def cygpath_to_windows(path: str) -> Path | None:
+    """Convert a single MSYS/Cygwin path to a native Windows path."""
+    return convert_paths([path]).get(path.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +277,8 @@ _LDD_LINE_RE = re.compile(
 )
 # Lines that carry a base address but no "=>": treat as informational only.
 _LDD_BARE_ADDR_RE = re.compile(r"^\s*\S+\s+\(0x[0-9A-Fa-f]+\)\s*$")
-_LDD_BASE_ADDR_RE = re.compile(r"\s*\([0-9A-Fa-fx]+\)\s*$")
+# Only a real hexadecimal base address is stripped, never e.g. "(1)".
+_LDD_BASE_ADDR_RE = re.compile(r"\s*\(0x[0-9A-Fa-f]+\)\s*$")
 
 
 def run_ldd(executable: Path, *, verbose: bool = False) -> str:
@@ -186,7 +288,8 @@ def run_ldd(executable: Path, *, verbose: bool = False) -> str:
     MSYS2/Cygwin ldd commonly exits non-zero *with valid output* when one
     dependency is "not found". We treat usable output as success and let
     the caller decide what to do via the parsed dependency list. Only an
-    empty result is a hard failure.
+    empty result is a hard failure here; output that parses to zero
+    dependencies is rejected by the caller.
     """
     ldd = shutil.which("ldd")
 
@@ -220,14 +323,13 @@ def run_ldd(executable: Path, *, verbose: bool = False) -> str:
             f"(exit code {result.returncode})."
         )
 
-    if result.returncode != 0:
+    if result.returncode != 0 and verbose:
         # Non-zero exit with usable output is expected when dependencies
         # are missing; do not abort the deployment over it.
-        if verbose:
-            warn(
-                f"  [ldd] exited with code {result.returncode}; "
-                f"parsing output anyway."
-            )
+        warn(
+            f"  [ldd] exited with code {result.returncode}; "
+            f"parsing output anyway."
+        )
 
     return output
 
@@ -261,8 +363,8 @@ def parse_ldd_output(
     (e.g. the main executable's own entry on some ldd variants) are
     informational and are reported only under ``verbose``.
     """
-    dependencies: list[Dependency] = []
-    seen: set[tuple[str, str | None]] = set()
+    # Pass 1: split the text into (name, raw_path | None) entries.
+    entries: list[tuple[str, str | None]] = []
 
     for line in output.splitlines():
         line = line.strip()
@@ -283,23 +385,33 @@ def parse_ldd_output(
         rest = match.group("rest").strip()
 
         if rest.lower() == "not found":
-            key = (name.lower(), None)
-            if key not in seen:
-                dependencies.append(_make_not_found(name))
-                seen.add(key)
+            entries.append((name, None))
             continue
 
         # Strip an optional trailing base-address "(0x...)" segment.
         raw_path = _LDD_BASE_ADDR_RE.sub("", rest).strip()
 
         if not raw_path or raw_path.lower() == "not found":
+            entries.append((name, None))
+        else:
+            entries.append((name, raw_path))
+
+    # Pass 2: convert every path in one batch.
+    converted = convert_paths(raw for _, raw in entries if raw is not None)
+
+    # Pass 3: build the de-duplicated dependency list, preserving order.
+    dependencies: list[Dependency] = []
+    seen: set[tuple[str, str | None]] = set()
+
+    for name, raw_path in entries:
+        if raw_path is None:
             key = (name.lower(), None)
             if key not in seen:
                 dependencies.append(_make_not_found(name))
                 seen.add(key)
             continue
 
-        windows_path = cygpath_to_windows(raw_path)
+        windows_path = converted.get(raw_path)
 
         key = (
             name.lower(),
@@ -330,39 +442,34 @@ def _normcase_normpath(path: Path | str) -> str:
     return ntpath.normcase(ntpath.normpath(str(path).replace("/", "\\")))
 
 
-_SYSTEM_ROOTS_CACHE: list[str] | None = None
-
-
-def _system_roots() -> list[str]:
+@functools.cache
+def _system_roots() -> tuple[str, ...]:
     """
     Return the normalized Windows system directories to skip.
 
     Computed once and cached, since resolving these per dependency is
-    needlessly expensive for large dependency lists.
+    needlessly expensive for large dependency lists. Tests can reset the
+    cache with ``_system_roots.cache_clear()``.
     """
-    global _SYSTEM_ROOTS_CACHE
-    if _SYSTEM_ROOTS_CACHE is not None:
-        return _SYSTEM_ROOTS_CACHE
-
     windir = os.environ.get("WINDIR")
     if not windir:
         # Only fall back to the conventional location on Windows.
         if os.name != "nt":
-            _SYSTEM_ROOTS_CACHE = []
-            return _SYSTEM_ROOTS_CACHE
+            return ()
         windir = r"C:\Windows"
 
-    windows = Path(windir)
     roots: list[str] = []
     for name in ("System32", "SysWOW64", "WinSxS"):
-        candidate = windows / name
-        try:
-            roots.append(_normcase_normpath(candidate.resolve()))
-        except OSError:
-            roots.append(_normcase_normpath(candidate.absolute()))
+        candidate = ntpath.join(windir, name)
+        if os.name == "nt":
+            # Follow junctions/symlinks so comparisons use real locations.
+            try:
+                candidate = os.path.realpath(candidate)
+            except OSError:
+                pass
+        roots.append(_normcase_normpath(candidate))
 
-    _SYSTEM_ROOTS_CACHE = roots
-    return roots
+    return tuple(roots)
 
 
 def is_system_dll(path: Path) -> bool:
@@ -371,20 +478,18 @@ def is_system_dll(path: Path) -> bool:
 
     System32, SysWOW64, and WinSxS are skipped by default.
     """
-    try:
-        resolved = path.resolve()
-    except OSError:
-        resolved = path
+    resolved: Path | str = path
+    if os.name == "nt":
+        try:
+            resolved = path.resolve()
+        except OSError:
+            pass
 
+    # _normcase_normpath always yields backslash-separated paths.
     resolved_str = _normcase_normpath(resolved)
 
     for root in _system_roots():
-        if resolved_str == root:
-            return True
-        if resolved_str.startswith(root + os.sep):
-            return True
-        # Also accept "/" as a separator (cygpath -m can emit forward slashes).
-        if resolved_str.startswith(root + "/"):
+        if resolved_str == root or resolved_str.startswith(root + "\\"):
             return True
 
     return False
@@ -394,22 +499,20 @@ def is_system_dll(path: Path) -> bool:
 # File operations
 # ---------------------------------------------------------------------------
 
-def _sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def _files_equal(a: Path, b: Path) -> bool:
     """Return True if both files exist and have identical contents."""
     try:
-        if a.stat().st_size != b.stat().st_size:
-            return False
+        return filecmp.cmp(a, b, shallow=False)
     except OSError:
         return False
-    return _sha256(a) == _sha256(b)
+
+
+def _make_writable(path: Path) -> None:
+    """Clear the read-only attribute so the file can be overwritten."""
+    try:
+        path.chmod(path.stat().st_mode | stat.S_IWRITE)
+    except OSError:
+        pass
 
 
 def copy_file(
@@ -455,6 +558,7 @@ def copy_file(
             )
         if verbose:
             info(f"Overwriting: {destination.name}")
+        _make_writable(destination)
 
     shutil.copy2(source, destination)
     info(f"{label}: {source}")
@@ -465,16 +569,32 @@ def copy_file(
 # Qt deployment
 # ---------------------------------------------------------------------------
 
+# Qt5Core.dll, Qt6Core.dll, Qt6Cored.dll, QtCore4.dll, libQt5Core.dll, ...
+_QT_CORE_RE = re.compile(
+    r"^(?:lib)?Qt\d*Core[A-Za-z]*\d*\.dll$",
+    re.IGNORECASE,
+)
+
+
+def uses_qt(dependencies: Iterable[Dependency]) -> bool:
+    """Return True if any reported dependency is a Qt Core library."""
+    return any(_QT_CORE_RE.match(dep.name) for dep in dependencies)
+
+
 def run_windeployqt(
     executable: Path,
     output_dir: Path,
     verbose: bool,
+    extra_args: Sequence[str] = (),
 ) -> QtDeployResult:
     """
     Run windeployqt on the executable supplied by the caller.
 
     A missing tool is an optional skip. If the tool exists but fails,
     return FAILED so the overall deployment can report a non-zero status.
+
+    No ``--release``/``--debug`` flag is passed: windeployqt detects the
+    build type from the executable. Use ``extra_args`` to override.
     """
     windeployqt = shutil.which("windeployqt.exe") or shutil.which("windeployqt")
 
@@ -486,16 +606,16 @@ def run_windeployqt(
     # output directory via --dir.
     command = [
         windeployqt,
-        "--release",
         "--dir",
         str(output_dir),
+        *extra_args,
     ]
 
     if verbose:
         # windeployqt requires a numeric value for --verbose (e.g., --verbose 2).
         # Passing just "--verbose" causes an "Invalid value" error and exit code 1.
         command.extend(["--verbose", "2"])
-        
+
     command.append(str(executable))
 
     if verbose:
@@ -522,7 +642,8 @@ def run_windeployqt(
 
     info("Qt deployment completed.")
     return QtDeployResult.SUCCESS
-    
+
+
 # ---------------------------------------------------------------------------
 # Deployment
 # ---------------------------------------------------------------------------
@@ -548,48 +669,68 @@ def deploy(
     verbose: bool,
     overwrite: bool,
     strict: bool = False,
+    force_qt: bool = False,
+    qt_args: Sequence[str] = (),
 ) -> int:
     executable = executable.resolve()
     output_dir = output_dir.resolve()
 
     if not executable.is_file():
         warn(f"ERROR: executable not found: {executable}")
-        return 2
+        return ExitCode.EXE_NOT_FOUND
 
     if output_dir == executable.parent:
         warn(
             "ERROR: output directory resolves to the input directory. "
             "Choose a distinct output folder."
         )
-        return 6
+        return ExitCode.BAD_OUTPUT_DIR
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    section("Copying Executable")
-    try:
-        copy_file(
-            executable,
-            output_dir,
-            label="Copied executable",
-            verbose=verbose,
-            overwrite=overwrite,
-        )
-    except (OSError, shutil.Error) as exc:
-        warn(f"ERROR: failed to copy executable: {exc}")
-        return 5
-    info(f"Destination: {output_dir / executable.name}")
-
+    # Discover dependencies first so a failed scan leaves no half-made
+    # output directory behind.
     section("Searching Dependencies")
 
     try:
         raw_ldd = run_ldd(executable, verbose=verbose)
     except RuntimeError as exc:
         warn(f"ERROR: {exc}")
-        return 3
+        return ExitCode.LDD_FAILED
 
     dependencies = parse_ldd_output(raw_ldd, verbose=verbose)
 
+    if not dependencies:
+        # Every Windows executable has at least one dependency, so an
+        # empty list means ldd failed (wrong file type, unreadable file...).
+        warn("ERROR: ldd reported no dependencies. Its output was:")
+        for line in raw_ldd.strip().splitlines()[:10]:
+            warn(f"  {line}")
+        return ExitCode.LDD_FAILED
+
     info(f"Total dependencies found: {len(dependencies)}")
+
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        warn(f"ERROR: cannot create output directory {output_dir}: {exc}")
+        return ExitCode.BAD_OUTPUT_DIR
+
+    section("Copying Executable")
+    try:
+        # The executable is always refreshed: after a rebuild it differs
+        # from the previously deployed copy, which is expected.
+        copy_file(
+            executable,
+            output_dir,
+            label="Copied executable",
+            verbose=verbose,
+            overwrite=True,
+        )
+    except (OSError, shutil.Error) as exc:
+        warn(f"ERROR: failed to copy executable: {exc}")
+        return ExitCode.COPY_FAILED
+    info(f"Destination: {output_dir / executable.name}")
+
+    section("Copying Dependencies")
 
     copied = 0
     already_present = 0
@@ -643,13 +784,17 @@ def deploy(
             if not same_source:
                 copy_failures += 1
                 warn(
-                    f"{progress} DLL NAME COLLISION: {dll.name}\\n"
-                    f"    First source : {previous_source}\\n"
-                    f"    Second source: {dll}\\n"
+                    f"{progress} DLL NAME COLLISION: {dll.name}\n"
+                    f"    First source : {previous_source}\n"
+                    f"    Second source: {dll}\n"
                     "    Both files cannot safely occupy the same flat "
                     "deployment directory. Resolve this conflict manually."
                 )
                 continue
+
+        # Record the claim before copying so that a failed copy still
+        # blocks a later, different DLL with the same name.
+        basename_sources[basename_key] = dll
 
         try:
             result = copy_file(
@@ -659,10 +804,10 @@ def deploy(
                 verbose=verbose,
                 overwrite=overwrite,
             )
-            basename_sources[basename_key] = dll
             if result is CopyResult.COPIED:
                 copied += 1
-            elif result is CopyResult.ALREADY_PRESENT:
+            else:
+                # ALREADY_PRESENT or SAME_FILE: nothing to do.
                 already_present += 1
         except (OSError, shutil.Error) as exc:
             copy_failures += 1
@@ -678,40 +823,72 @@ def deploy(
         info(f"Copy failures          : {copy_failures}")
 
     qt_result = QtDeployResult.SKIPPED
-    if not no_qt:
+    if no_qt:
+        pass
+    elif force_qt or uses_qt(dependencies):
         section("Searching For Qt Dependencies")
         deployed_executable = output_dir / executable.name
         qt_result = run_windeployqt(
             deployed_executable,
             output_dir,
             verbose,
+            qt_args,
+        )
+    else:
+        info()
+        info(
+            "No Qt libraries detected; windeployqt skipped "
+            "(use --force-qt to run it anyway)."
         )
 
     section("Deployment Finished")
     info(f"Executable : {executable}")
     info(f"Output     : {output_dir}")
 
-    # Missing dependencies are useful diagnostics and should produce a
-    # non-zero status, while unresolved parser lines alone do not
-    # necessarily mean the executable cannot run.
+    # Collect every problem so none is hidden behind another, then return
+    # the code of the first one. Missing dependencies are useful
+    # diagnostics and produce a non-zero status, while unresolved parser
+    # lines alone do not (unless --strict is given).
+    problems: list[tuple[ExitCode, str]] = []
     if missing:
-        return 4
+        problems.append(
+            (ExitCode.MISSING_DEPS, f"{missing} missing dependency(ies)")
+        )
     if copy_failures:
-        return 5
+        problems.append(
+            (ExitCode.COPY_FAILED, f"{copy_failures} copy failure(s)")
+        )
     if qt_result is QtDeployResult.FAILED:
-        return 7
+        problems.append((ExitCode.QT_FAILED, "windeployqt failed"))
     if strict and unresolved:
-        return 8
+        problems.append(
+            (ExitCode.UNRESOLVED, f"{unresolved} unresolved dependency(ies)")
+        )
 
-    return 0
+    if problems:
+        info()
+        warn("Problems:")
+        for code, text in problems:
+            warn(f"  [{int(code)}] {text}")
+        return problems[0][0]
+
+    return ExitCode.OK
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
+class _Parser(argparse.ArgumentParser):
+    """ArgumentParser whose usage errors do not collide with exit code 2."""
+
+    def error(self, message: str):  # type: ignore[override]
+        self.print_usage(sys.stderr)
+        self.exit(int(ExitCode.USAGE), f"{self.prog}: error: {message}\n")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="cpldd",
         description="Copy Windows DLL dependencies reported by ldd.",
     )
@@ -744,13 +921,38 @@ def build_parser() -> argparse.ArgumentParser:
         "--force-overwrite",
         action="store_true",
         dest="overwrite",
-        help="Overwrite existing destination files with different contents.",
+        help=(
+            "Overwrite existing destination DLLs with different contents. "
+            "(The executable itself is always refreshed.)"
+        ),
     )
 
     parser.add_argument(
         "--no-qt",
         action="store_true",
         help="Do not run windeployqt.",
+    )
+
+    parser.add_argument(
+        "--force-qt",
+        action="store_true",
+        help=(
+            "Run windeployqt even if no Qt library is among the "
+            "dependencies (e.g. Qt loaded dynamically)."
+        ),
+    )
+
+    parser.add_argument(
+        "--windeployqt-arg",
+        action="append",
+        default=None,
+        dest="qt_args",
+        metavar="ARG",
+        help=(
+            "Extra argument passed to windeployqt; repeat as needed. "
+            "Use the '=' form for values starting with '-', e.g. "
+            "--windeployqt-arg=--debug."
+        ),
     )
 
     parser.add_argument(
@@ -773,6 +975,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    configure_console()
+
     parser = build_parser()
     args = parser.parse_args()
 
@@ -793,14 +997,18 @@ def main() -> int:
     info(f"  Strict checking    : {'yes' if args.strict else 'no'}")
     info()
 
-    return deploy(
-        input_exe,
-        output_dir,
-        force_system=args.force_system,
-        no_qt=args.no_qt,
-        verbose=args.verbose,
-        overwrite=args.overwrite,
-        strict=args.strict,
+    return int(
+        deploy(
+            input_exe,
+            output_dir,
+            force_system=args.force_system,
+            no_qt=args.no_qt,
+            verbose=args.verbose,
+            overwrite=args.overwrite,
+            strict=args.strict,
+            force_qt=args.force_qt,
+            qt_args=args.qt_args or [],
+        )
     )
 
 
