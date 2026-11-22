@@ -71,7 +71,7 @@ class ExitCode(enum.IntEnum):
     USAGE = 64
 
 
-class DepStatus(str, enum.Enum):
+class DepStatus(enum.StrEnum):
     """Classification of a single ldd-reported dependency."""
 
     RESOLVED = "resolved"
@@ -149,18 +149,18 @@ def strike(text: str) -> str:
 
 
 def info(message: str = "") -> None:
-    print(message)
+    print(message, flush=True)
 
 
 def warn(message: str) -> None:
-    print(message, file=sys.stderr)
+    print(message, file=sys.stderr, flush=True)
 
 
 def section(title: str) -> None:
-    print()
-    print("=" * 60)
-    print(f" {title}")
-    print("=" * 60)
+    print(flush=True)
+    print("=" * 60, flush=True)
+    print(f" {title}", flush=True)
+    print("=" * 60, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +170,21 @@ def section(title: str) -> None:
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 _CYGDRIVE_RE = re.compile(r"^/cygdrive/([A-Za-z])/(.*)$")
 _MSYS_DRIVE_RE = re.compile(r"^/([A-Za-z])/(.*)$")
+
+
+def _find_cygpath() -> str | None:
+    """Locate cygpath on PATH or alongside the active ldd executable."""
+    cygpath = shutil.which("cygpath")
+    if cygpath:
+        return cygpath
+
+    ldd = shutil.which("ldd")
+    if ldd:
+        sibling = Path(ldd).with_name("cygpath.exe" if os.name == "nt" else "cygpath")
+        if sibling.is_file():
+            return str(sibling)
+
+    return None
 
 
 def _fallback_windows_path(path: str) -> Path | None:
@@ -185,45 +200,92 @@ def _fallback_windows_path(path: str) -> Path | None:
     return None
 
 
+def _decode_cygpath_output(data: bytes, expected: int) -> list[str] | None:
+    """Decode newline-delimited cygpath output without text-mode translation."""
+    try:
+        output = data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return None
+
+    # cygpath emits one path per line. Accept LF and CRLF, but do not use
+    # splitlines(), which also treats other characters as line separators.
+    lines = output.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    lines = [line[:-1] if line.endswith("\r") else line for line in lines]
+    if len(lines) != expected:
+        return None
+    if any(not line.strip() for line in lines):
+        return None
+    return lines
+
+
+def _cygpath_single(cygpath: str, path: str) -> str | None:
+    """Retry one path independently after a failed or malformed batch."""
+    if not path or "\n" in path or "\r" in path:
+        return None
+    try:
+        result = subprocess.run(
+            [cygpath, "-C", "UTF8", "-m", path],
+            capture_output=True,
+            text=False,
+            check=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    decoded = _decode_cygpath_output(result.stdout, 1)
+    return decoded[0] if decoded else None
+
+
 def _cygpath_batch(paths: list[str]) -> list[str | None]:
     """Convert many MSYS/Cygwin paths with one cygpath process.
 
-    Uses UTF-8 explicitly and preserves input order. Returns one None per
-    input if cygpath is unavailable, fails, or produces ambiguous output.
+    Binary I/O avoids Windows text-mode newline translation. If the batch
+    fails or its output is malformed, retry each eligible path separately
+    so one problematic entry does not discard otherwise valid conversions.
     """
     if not paths:
         return []
 
     failed: list[str | None] = [None] * len(paths)
-
-    # -f consumes newline-delimited input, so embedded newlines are ambiguous.
-    if any("\n" in path or "\r" in path for path in paths):
-        return failed
-
-    cygpath = shutil.which("cygpath")
+    cygpath = _find_cygpath()
     if not cygpath:
         return failed
 
+    # -f consumes newline-delimited input, so embedded newlines are ambiguous.
+    eligible = [
+        i
+        for i, path in enumerate(paths)
+        if path and "\n" not in path and "\r" not in path
+    ]
+    if not eligible:
+        return failed
+
+    batch_paths = [paths[i] for i in eligible]
     try:
         result = subprocess.run(
             [cygpath, "-C", "UTF8", "-m", "-f", "-"],
-            input="\n".join(paths) + "\n",
+            input=("\n".join(batch_paths) + "\n").encode("utf-8"),
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="strict",
+            text=False,
             check=True,
             timeout=30,
         )
+        converted = _decode_cygpath_output(result.stdout, len(batch_paths))
     except (OSError, UnicodeError, subprocess.SubprocessError):
+        converted = None
+
+    if converted is not None:
+        for index, value in zip(eligible, converted):
+            failed[index] = value
         return failed
 
-    # Do not strip: whitespace may be part of a valid path component.
-    lines = result.stdout.splitlines()
-    if len(lines) != len(paths):
-        return failed
-
-    return [line if line else None for line in lines]
+    # Batch output cannot be trusted. Retry independently to salvage good paths.
+    for index in eligible:
+        failed[index] = _cygpath_single(cygpath, paths[index])
+    return failed
 
 
 def convert_paths(paths: Iterable[str]) -> dict[str, Path | None]:
@@ -235,14 +297,16 @@ def convert_paths(paths: Iterable[str]) -> dict[str, Path | None]:
     because it handles the active MSYS/Cygwin environment correctly; the
     drive-letter regexes are only a fallback.
 
-    The result maps each (whitespace-stripped) input path to its Windows
-    path, or ``None`` if it could not be converted.
+    Input paths are preserved verbatim (never stripped) so legitimate leading
+    or trailing whitespace in path components is not altered. The result maps
+    each unique input path to its Windows path, or ``None`` if it could not
+    be converted.
     """
     result: dict[str, Path | None] = {}
     pending: list[str] = []
 
-    for raw in dict.fromkeys(p.strip() for p in paths):
-        if not raw or raw in {"?", "??"}:
+    for raw in dict.fromkeys(paths):
+        if not raw or not raw.strip() or raw in {"?", "??"}:
             result[raw] = None
         elif _WINDOWS_DRIVE_RE.match(raw):
             # Already a native Windows path.
@@ -262,7 +326,7 @@ def convert_paths(paths: Iterable[str]) -> dict[str, Path | None]:
 
 def cygpath_to_windows(path: str) -> Path | None:
     """Convert a single MSYS/Cygwin path to a native Windows path."""
-    return convert_paths([path]).get(path.strip())
+    return convert_paths([path]).get(path)
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +469,7 @@ def parse_ldd_output(
 
     for name, raw_path in entries:
         if raw_path is None:
-            key = (name.lower(), None)
+            key = (name.casefold(), None)
             if key not in seen:
                 dependencies.append(_make_not_found(name))
                 seen.add(key)
@@ -414,8 +478,8 @@ def parse_ldd_output(
         windows_path = converted.get(raw_path)
 
         key = (
-            name.lower(),
-            str(windows_path).lower() if windows_path else raw_path.lower(),
+            name.casefold(),
+            str(windows_path).casefold() if windows_path else raw_path.casefold(),
         )
         if key in seen:
             continue
@@ -621,6 +685,9 @@ def run_windeployqt(
     if verbose:
         info("Running: " + subprocess.list2cmdline(command))
 
+    sys.stdout.flush()
+    sys.stderr.flush()
+
     try:
         result = subprocess.run(
             command,
@@ -683,6 +750,13 @@ def deploy(
         warn(
             "ERROR: output directory resolves to the input directory. "
             "Choose a distinct output folder."
+        )
+        return ExitCode.BAD_OUTPUT_DIR
+
+    if output_dir.exists() and not output_dir.is_dir():
+        warn(
+            f"ERROR: output path already exists and is not a directory: "
+            f"{output_dir}"
         )
         return ExitCode.BAD_OUTPUT_DIR
 
@@ -927,13 +1001,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    parser.add_argument(
+    qt_group = parser.add_mutually_exclusive_group()
+    qt_group.add_argument(
         "--no-qt",
         action="store_true",
         help="Do not run windeployqt.",
     )
 
-    parser.add_argument(
+    qt_group.add_argument(
         "--force-qt",
         action="store_true",
         help=(
