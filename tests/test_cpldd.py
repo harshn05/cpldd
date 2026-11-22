@@ -109,6 +109,44 @@ class ParseLddTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Path conversion & normalization
+# ---------------------------------------------------------------------------
+
+class PathConversionTests(unittest.TestCase):
+    def test_convert_paths_preserves_leading_and_trailing_spaces(self) -> None:
+        samples = [
+            "/c/dir/trailing space ",
+            " /c/leading space/a.dll",
+            r"C:\dir\trailing space ",
+        ]
+        with mock.patch.object(cpldd, "_cygpath_batch", side_effect=no_cygpath) as batch:
+            converted = cpldd.convert_paths(samples)
+
+        batch.assert_called_once_with(
+            ["/c/dir/trailing space ", " /c/leading space/a.dll"]
+        )
+        self.assertEqual(converted["/c/dir/trailing space "], Path("C:/dir/trailing space "))
+        self.assertIsNone(converted[" /c/leading space/a.dll"])
+        self.assertEqual(converted[r"C:\dir\trailing space "], Path(r"C:\dir\trailing space "))
+
+    def test_cygpath_to_windows_preserves_trailing_space_with_cygpath(self) -> None:
+        with mock.patch.object(
+            cpldd, "_cygpath_batch", return_value=["C:/dir/foo .dll"]
+        ) as batch:
+            result = cpldd.cygpath_to_windows("/c/dir/foo .dll ")
+
+        batch.assert_called_once_with(["/c/dir/foo .dll "])
+        self.assertEqual(result, Path("C:/dir/foo .dll"))
+
+    def test_convert_paths_rejects_blank_and_question_placeholders(self) -> None:
+        with mock.patch.object(cpldd, "_cygpath_batch") as batch:
+            converted = cpldd.convert_paths(["", "   ", "?", "??"])
+
+        batch.assert_not_called()
+        self.assertEqual(converted, {"": None, "   ": None, "?": None, "??": None})
+
+
+# ---------------------------------------------------------------------------
 # cygpath batch conversion
 # ---------------------------------------------------------------------------
 
@@ -120,54 +158,82 @@ class CygpathBatchTests(unittest.TestCase):
         which.assert_not_called()
         run.assert_not_called()
 
-    def test_successful_batch_uses_utf8_and_preserves_order(self) -> None:
-        completed = mock.Mock(stdout="C:/Program Files/a.dll\nD:/München/b.dll\n", returncode=0)
+    def test_successful_binary_batch_preserves_order_and_utf8(self) -> None:
+        completed = mock.Mock(
+            stdout="C:/Program Files/a.dll\r\nD:/München/b.dll\r\n".encode("utf-8")
+        )
         with mock.patch.object(cpldd.shutil, "which", return_value="cygpath.exe"), \
              mock.patch.object(cpldd.subprocess, "run", return_value=completed) as run:
             result = cpldd._cygpath_batch(["/c/Program Files/a.dll", "/d/München/b.dll"])
         self.assertEqual(result, ["C:/Program Files/a.dll", "D:/München/b.dll"])
         args, kwargs = run.call_args
         self.assertEqual(args[0], ["cygpath.exe", "-C", "UTF8", "-m", "-f", "-"])
-        self.assertEqual(kwargs["encoding"], "utf-8")
-        self.assertEqual(kwargs["errors"], "strict")
+        self.assertEqual(kwargs["input"], "/c/Program Files/a.dll\n/d/München/b.dll\n".encode("utf-8"))
+        self.assertIs(kwargs["text"], False)
         self.assertEqual(kwargs["timeout"], 30)
 
     def test_missing_cygpath(self) -> None:
         with mock.patch.object(cpldd.shutil, "which", return_value=None):
             self.assertEqual(cpldd._cygpath_batch(["/c/a.dll", "/d/b.dll"]), [None, None])
 
-    def test_process_failure(self) -> None:
+    def test_finds_cygpath_sibling_next_to_ldd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp)
+            ldd_bin = bin_dir / "ldd"
+            cygpath_name = "cygpath.exe" if os.name == "nt" else "cygpath"
+            cygpath_bin = bin_dir / cygpath_name
+            ldd_bin.write_text("")
+            cygpath_bin.write_text("")
+
+            def fake_which(cmd: str) -> str | None:
+                return str(ldd_bin) if cmd == "ldd" else None
+
+            with mock.patch.object(cpldd.shutil, "which", side_effect=fake_which):
+                self.assertEqual(cpldd._find_cygpath(), str(cygpath_bin))
+
+    def test_process_failure_retries_each_path(self) -> None:
         with mock.patch.object(cpldd.shutil, "which", return_value="cygpath"), \
-             mock.patch.object(cpldd.subprocess, "run", side_effect=cpldd.subprocess.CalledProcessError(1, "cygpath")):
+             mock.patch.object(cpldd.subprocess, "run", side_effect=[
+                 cpldd.subprocess.CalledProcessError(1, "cygpath"),
+                 mock.Mock(stdout=b"C:/a.dll\n"),
+                 mock.Mock(stdout=b"D:/b.dll\n"),
+             ]) as run:
+            self.assertEqual(cpldd._cygpath_batch(["/c/a.dll", "/d/b.dll"]), ["C:/a.dll", "D:/b.dll"])
+        self.assertEqual(run.call_count, 3)
+
+    def test_malformed_batch_retries_paths_individually(self) -> None:
+        with mock.patch.object(cpldd.shutil, "which", return_value="cygpath"), \
+             mock.patch.object(cpldd.subprocess, "run", side_effect=[
+                 mock.Mock(stdout=b"C:/only-one.dll\n"),
+                 mock.Mock(stdout=b"C:/a.dll\n"),
+                 mock.Mock(stdout=b"D:/b.dll\n"),
+             ]):
+            self.assertEqual(cpldd._cygpath_batch(["/c/a.dll", "/d/b.dll"]), ["C:/a.dll", "D:/b.dll"])
+
+    def test_invalid_utf8_batch_retries_individually(self) -> None:
+        with mock.patch.object(cpldd.shutil, "which", return_value="cygpath"), \
+             mock.patch.object(cpldd.subprocess, "run", side_effect=[
+                 mock.Mock(stdout=b"\xff\n"),
+                 mock.Mock(stdout=b"C:/a.dll\n"),
+             ]):
+            self.assertEqual(cpldd._cygpath_batch(["/c/a.dll"]), ["C:/a.dll"])
+
+    def test_whitespace_only_output_is_rejected(self) -> None:
+        with mock.patch.object(cpldd.shutil, "which", return_value="cygpath"), \
+             mock.patch.object(cpldd.subprocess, "run", side_effect=[
+                 mock.Mock(stdout=b"   \n"),
+                 mock.Mock(stdout=b""),
+             ]):
             self.assertEqual(cpldd._cygpath_batch(["/c/a.dll"]), [None])
 
-    def test_os_error_and_decode_error(self) -> None:
+    def test_embedded_newline_path_does_not_poison_batch(self) -> None:
         with mock.patch.object(cpldd.shutil, "which", return_value="cygpath"), \
-             mock.patch.object(cpldd.subprocess, "run", side_effect=OSError("failed")):
-            self.assertEqual(cpldd._cygpath_batch(["/c/a.dll"]), [None])
-        decode_error = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")
-        with mock.patch.object(cpldd.shutil, "which", return_value="cygpath"), \
-             mock.patch.object(cpldd.subprocess, "run", side_effect=decode_error):
-            self.assertEqual(cpldd._cygpath_batch(["/c/a.dll"]), [None])
-
-    def test_wrong_output_count(self) -> None:
-        completed = mock.Mock(stdout="C:/only-one.dll\n", returncode=0)
-        with mock.patch.object(cpldd.shutil, "which", return_value="cygpath"), \
-             mock.patch.object(cpldd.subprocess, "run", return_value=completed):
-            self.assertEqual(cpldd._cygpath_batch(["/c/a.dll", "/c/b.dll"]), [None, None])
-
-    def test_empty_line_maps_to_none_and_whitespace_is_preserved(self) -> None:
-        completed = mock.Mock(stdout="C:/ folder /a.dll\n\n", returncode=0)
-        with mock.patch.object(cpldd.shutil, "which", return_value="cygpath"), \
-             mock.patch.object(cpldd.subprocess, "run", return_value=completed):
-            self.assertEqual(cpldd._cygpath_batch(["/c/ folder /a.dll", "/c/b.dll"]), ["C:/ folder /a.dll", None])
-
-    def test_embedded_newline_rejects_batch(self) -> None:
-        with mock.patch.object(cpldd.shutil, "which") as which, \
-             mock.patch.object(cpldd.subprocess, "run") as run:
-            self.assertEqual(cpldd._cygpath_batch(["/c/good.dll", "/c/bad\nname.dll"]), [None, None])
-        which.assert_not_called()
-        run.assert_not_called()
+             mock.patch.object(cpldd.subprocess, "run", return_value=mock.Mock(stdout=b"C:/good.dll\n")) as run:
+            self.assertEqual(
+                cpldd._cygpath_batch(["/c/good.dll", "/c/bad\nname.dll"]),
+                ["C:/good.dll", None],
+            )
+        run.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +350,11 @@ class ConsoleTests(unittest.TestCase):
             cpldd.build_parser().parse_args([])
         self.assertEqual(cm.exception.code, 64)
 
+    def test_no_qt_and_force_qt_are_mutually_exclusive(self) -> None:
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
+            cpldd.build_parser().parse_args(["app.exe", "--no-qt", "--force-qt"])
+        self.assertEqual(cm.exception.code, 64)
+
 
 # ---------------------------------------------------------------------------
 # deploy()
@@ -376,7 +447,7 @@ class DeployTests(unittest.TestCase):
         rc, _, err = self.run_deploy([self.dep(first), self.dep(second)])
         self.assertEqual(rc, 5)
         self.assertIn("DLL NAME COLLISION", err)
-        self.assertIn("\n    First source", err)  # real line breaks, not "\\n"
+        self.assertIn("\n    First source", err)  # real line breaks, not "\n"
         self.assertEqual((self.out / "dup.dll").read_bytes(), b"1")
 
     def test_all_problems_are_listed_first_code_returned(self) -> None:
